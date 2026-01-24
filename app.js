@@ -496,24 +496,62 @@ export const actions = {
 
 
 /***** BLOCK START 5: FLOW（画面遷移制御） *****/
+/**
+ * FLOW責務：
+ * - 画面遷移制御（screenの変更）
+ * - 遷移条件（未回答判定：範囲限定）
+ * - q11_20 → alias 直前の result 生成を await して state.result を確定
+ * - 描画は ui_*.js の render に委譲（DOM生成は禁止）
+ *
+ * 注意：
+ * - document.getElementById 等のDOM参照は禁止（BOOTSTRAPのみ）
+ * - root は BOOTSTRAP から受け取った参照のみを使う
+ */
 
-let _FLOW_ROOT = null;
+let _root_ref = null;
+
+/** 現在の state.answers（{qid,v}配列）から「最新の1件」を採用して Map 化 */
+function _answers_latest_map() {
+  const m = new Map();
+  const a = state.answers;
+  if (!Array.isArray(a)) return m;
+  for (let i = 0; i < a.length; i++) {
+    const it = a[i];
+    if (!it || typeof it.qid !== "string") continue;
+    m.set(it.qid, it.v);
+  }
+  return m;
+}
+
+/** qids の範囲に対する「全回答済み」判定（重複qidは最新採用・理由にして拒否しない） */
+function _is_all_answered_for_qids(qids) {
+  const m = _answers_latest_map();
+  for (let i = 0; i < qids.length; i++) {
+    const qid = qids[i];
+    if (!m.has(qid)) return false;
+    const v = m.get(qid);
+    if (!Number.isInteger(v) || v < 1 || v > 5) return false;
+  }
+  return true;
+}
+
+function _qids_range(from, to) {
+  const out = [];
+  for (let n = from; n <= to; n++) out.push(`Q${n}`);
+  return out;
+}
+
+function _is_valid_screen(screen) {
+  return Array.isArray(SCREENS) && SCREENS.includes(screen);
+}
 
 /**
- * _render_dispatch(root)
- * 契約：
- * - 画面描画は必ず root を引数として行う
- * - FLOW 内で root を再取得しない（document.getElementById 禁止）
- * - UI 描画は ui_*.js の render に委譲する
- *
- * @param {HTMLElement} root
+ * 画面描画の唯一のディスパッチ
+ * - root は BOOTSTRAP 由来の参照のみを受け取る
+ * - render は必ず root, ctx を渡す
  */
 function _render_dispatch(root) {
-  if (!(root instanceof HTMLElement)) return;
-
-  // root保持（参照のみ）
-  _FLOW_ROOT = root;
-
+  _root_ref = root; // FLOW 内保持（参照のみ）
   const ctx = { state, actions };
 
   switch (state.screen) {
@@ -536,7 +574,7 @@ function _render_dispatch(root) {
       renderResult(root, ctx);
       return;
     default:
-      // 未定義 screen は title に補正（補完なし）
+      // 未定義screenの補完は禁止 → ただし破綻防止のため title に戻す（screen値自体が不正な場合）
       state.screen = "title";
       persistState();
       renderTitle(root, ctx);
@@ -544,193 +582,85 @@ function _render_dispatch(root) {
   }
 }
 
-function _flow_isInt1to5(v) {
-  return Number.isInteger(v) && v >= 1 && v <= 5;
-}
-
 /**
- * 最新のみ有効（後勝ち）で、qid->v を作る（Q1..Q20のみ）
- * - 重複qidは拒否理由にしない
+ * q11_20 完了後、alias 直前でのみ result を生成する（契約）
+ * - 3B が「正常な result object を返せなかった」場合は null
+ *
+ * NOTE:
+ * - 本ブロックでは別紙呼び出しは禁止（3Bのみ）。
+ * - よって、ここは 3B 内で定義された result生成関数に委譲する前提。
+ * - 3B 側で以下の関数が用意されている想定：
+ *     async function _internal_build_result_or_null() { ... }
+ *
+ * 3B が別名の場合は、あなたの app.js 側でこの呼び出し先を一致させること。
  */
-function _flow_buildLatestMap() {
-  const m = new Map();
-  if (!Array.isArray(state.answers)) return m;
-
-  for (const a of state.answers) {
-    if (!a || typeof a !== "object") continue;
-    if (typeof a.qid !== "string") continue;
-
-    const mm = /^Q(\d{1,2})$/.exec(a.qid);
-    if (!mm) continue;
-
-    const n = Number(mm[1]);
-    if (!Number.isInteger(n) || n < 1 || n > 20) continue;
-
-    if (!_flow_isInt1to5(a.v)) continue;
-
-    m.set(a.qid, a.v); // 後勝ち
+async function _build_result_before_alias_or_null() {
+  if (typeof _internal_build_result_or_null !== "function") {
+    // 必須依存欠け：即停止に近い扱い（ここで代替生成はしない）
+    return null;
   }
-
-  return m;
-}
-
-/**
- * 画面別の未回答判定（Q範囲のみ）
- * - 件数で判定しない
- * - 重複qidは最新のみ有効
- */
-function _flow_isAnsweredRange(from, to) {
-  const latest = _flow_buildLatestMap();
-  for (let i = from; i <= to; i += 1) {
-    if (!latest.has(`Q${i}`)) return false;
+  try {
+    const r = await _internal_build_result_or_null();
+    // 「正常な result object を返せなかった」＝ null 扱い（契約）
+    if (!r || typeof r !== "object" || Array.isArray(r)) return null;
+    return r;
+  } catch (_e) {
+    // 失敗理由は 3B 内部で吸収するのが契約だが、ここでは外に出さず null 化のみ
+    return null;
   }
-  return true;
 }
 
 /**
- * 別紙に渡す answers（{qid,v}×20）を最新のみ有効で構築
- * - 欠損があれば null
+ * 画面遷移の実体（共有名：固定）
+ * actions.go(screen) はこれを呼ぶだけ（ACTIONS側で委譲）
  */
-function _flow_buildAnswersLatest20() {
-  const latest = _flow_buildLatestMap();
-  const out = [];
-  for (let i = 1; i <= 20; i += 1) {
-    const qid = `Q${i}`;
-    const v = latest.get(qid);
-    if (!_flow_isInt1to5(v)) return null;
-    out.push({ qid, v });
-  }
-  return out;
-}
+async function _flow_go(screen) {
+  if (!_is_valid_screen(screen)) return;
 
-/**
- * start へ遷移する場合は全クリア（契約）
- */
-function _flow_clearAllToStart() {
-  state.screen = "start";
-  state.answers = [];
-  state.answersNormalized = null;
-  state.result = null;
-  state.runMode = "manual";
-}
-
-/**
- * _flow_go(screen)
- * - 画面遷移の実体
- * - result生成は q11_20→alias 直前の1箇所のみ（await必須）
- * - result生成失敗（result=null）でも alias へは遷移する（契約）
- * - result=null の場合、result 画面へは遷移させない（契約）
- */
-async function _flow_go(next) {
-  if (typeof next !== "string") return;
-  if (!Array.isArray(SCREENS) || !SCREENS.includes(next)) return;
-
-  const root = _FLOW_ROOT;
-  if (!(root instanceof HTMLElement)) return;
+  // root は BOOTSTRAP 初回renderで必ず設定される前提
+  if (!_root_ref) return;
 
   const from = state.screen;
-  const to = next;
+  const to = screen;
 
-  // title -> start（タップ）
-  if (from === "title" && to === "start") {
-    // start は開始画面なのでクリアして入る
-    _flow_clearAllToStart();
-    persistState();
-    _render_dispatch(root);
+  // result=null の場合、result 画面へ遷移しない（契約）
+  if (to === "result" && state.result == null) {
+    // 代替遷移の補完は禁止 → 画面は維持し再描画のみ
+    _render_dispatch(_root_ref);
     return;
   }
 
-  // どこからでも start（全クリア）
-  if (to === "start") {
-    _flow_clearAllToStart();
-    persistState();
-    _render_dispatch(root);
-    return;
-  }
-
-  // start -> q1_10（診断開始 / ランダム診断）
-  // ※ランダム回答の生成は UI が actions.setAnswer で行う（契約）
-  if (from === "start" && to === "q1_10") {
-    state.answersNormalized = null;
-    state.result = null;
-
-    state.screen = "q1_10";
-    persistState();
-    _render_dispatch(root);
-    return;
-  }
-
-  // q1_10 -> q11_20（判定対象：Q1..Q10のみ）
+  // 遷移条件（範囲限定）
   if (from === "q1_10" && to === "q11_20") {
-    if (!_flow_isAnsweredRange(1, 10)) return;
-
-    state.screen = "q11_20";
-    persistState();
-    _render_dispatch(root);
-    return;
+    if (!_is_all_answered_for_qids(_qids_range(1, 10))) {
+      _render_dispatch(_root_ref);
+      return;
+    }
   }
 
-  // q11_20 -> q1_10（戻る：回答保持）
-  if (from === "q11_20" && to === "q1_10") {
-    state.screen = "q1_10";
-    persistState();
-    _render_dispatch(root);
-    return;
-  }
-
-  // q11_20 -> alias（判定対象：Q11..Q20のみ）
-  // result生成はここ（q11_20完了後）のみ
   if (from === "q11_20" && to === "alias") {
-    if (!_flow_isAnsweredRange(11, 20)) return;
-
-    // 別紙へ渡すanswersは最新のみ有効で構築（欠損があれば遷移しない）
-    const answersLatest20 = _flow_buildAnswersLatest20();
-    if (answersLatest20 === null) return;
-
-    // 未回答がある場合は正規化も別紙も行わない（契約）
-    const normalized = _3a_buildAnswersNormalized(answersLatest20);
-    if (normalized === null) return;
-
-    // 失敗しても alias へは進める（契約）
-    let built = null;
-    try {
-      built = await _3b_buildResult({
-        answers: answersLatest20,
-        answersNormalized: normalized,
-      });
-    } catch (_) {
-      built = null;
+    if (!_is_all_answered_for_qids(_qids_range(11, 20))) {
+      _render_dispatch(_root_ref);
+      return;
     }
 
-    if (built !== null) {
-      state.answersNormalized = normalized;
-      state.result = built;
-    } else {
-      state.answersNormalized = null;
-      state.result = null;
-    }
-
-    state.screen = "alias";
+    // alias 直前でのみ result 生成（契約）
+    // result が null でも alias へ遷移（契約）
+    const built = await _build_result_before_alias_or_null();
+    state.result = built; // object or null
     persistState();
-    _render_dispatch(root);
-    return;
   }
 
-  // alias -> result（result が null の場合は遷移させない）
-  if (from === "alias" && to === "result") {
-    if (!state.result || typeof state.result !== "object" || Array.isArray(state.result)) return;
+  // 画面遷移（基本）
+  state.screen = to;
+  persistState();
 
-    state.screen = "result";
-    persistState();
-    _render_dispatch(root);
-    return;
-  }
-
-  // result -> start は全クリア（契約）は start 分岐で処理済み
-
-  // その他未定義：遷移しない
-  return;
+  // 描画（rootを明示的に渡す契約）
+  _render_dispatch(_root_ref);
 }
+
+
+
 
 /***** BLOCK END 5 *****/
 
